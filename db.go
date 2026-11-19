@@ -7,6 +7,7 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -127,6 +128,7 @@ type DB struct {
 	dataref  []byte // mmap'ed readonly, write throws SEGV
 	data     *[common.MaxMapSize]byte
 	datasz   int
+	mmapRef  *dbMmap
 	meta0    *common.Meta
 	meta1    *common.Meta
 	pageSize int
@@ -146,6 +148,7 @@ type DB struct {
 	metalock sync.Mutex   // Protects meta page access.
 	mmaplock sync.RWMutex // Protects mmap access during remapping.
 	statlock sync.RWMutex // Protects stats access.
+	readTxWG sync.WaitGroup
 
 	ops struct {
 		writeAt func(b []byte, off int64) (n int, err error)
@@ -154,6 +157,62 @@ type DB struct {
 	// Read only mode.
 	// When true, Update() and Begin(true) return ErrDatabaseReadOnly immediately.
 	readOnly bool
+}
+
+// dbMmap represents one immutable mapping of the database file.
+//
+// The DB keeps a reference to the current mapping. Read transactions pin the
+// mapping that is current when they begin so that a remap can install a new
+// mapping without invalidating readers that are still running. An old mapping
+// is unmapped only after the DB and all transactions using it have released it.
+type dbMmap struct {
+	dataref []byte
+	data    *[common.MaxMapSize]byte
+	size    int
+	refs    atomic.Int64
+}
+
+func newDBMmap(dataref []byte, data *[common.MaxMapSize]byte, size int) *dbMmap {
+	m := &dbMmap{
+		dataref: dataref,
+		data:    data,
+		size:    size,
+	}
+	m.refs.Store(1)
+	return m
+}
+
+func newDBMmapFromRef(dataref []byte, size int) *dbMmap {
+	return newDBMmap(dataref, (*[common.MaxMapSize]byte)(unsafe.Pointer(&dataref[0])), size)
+}
+
+func (m *dbMmap) retain() {
+	m.refs.Add(1)
+}
+
+func (m *dbMmap) release() error {
+	if m.refs.Add(-1) != 0 {
+		return nil
+	}
+	return munmap(m)
+}
+
+func (m *dbMmap) page(pageSize int, id common.Pgid) *common.Page {
+	pos := id * common.Pgid(pageSize)
+	return (*common.Page)(unsafe.Pointer(&m.data[pos]))
+}
+
+func (db *DB) setMmap(m *dbMmap) {
+	db.mmapRef = m
+	if m == nil {
+		db.dataref = nil
+		db.data = nil
+		db.datasz = 0
+		return
+	}
+	db.dataref = m.dataref
+	db.data = m.data
+	db.datasz = m.size
 }
 
 // Path returns the path to currently open database file.
@@ -493,69 +552,74 @@ func (db *DB) mmap(minsz int) (err error) {
 		}
 	}
 
-	if db.Mlock {
-		// Unlock db memory
-		if err := db.munlock(fileSize); err != nil {
-			return err
-		}
-	}
-
-	// Dereference all mmap references before unmapping.
-	if db.rwtx != nil {
-		db.rwtx.root.dereference()
-	}
-
-	// Unmap existing data before continuing.
-	if err = db.munmap(); err != nil {
-		return err
-	}
-
 	// Memory-map the data file as a byte slice.
 	// gofail: var mapError string
 	// return errors.New(mapError)
-	if err = mmap(db, size); err != nil {
+	newMmap, err := mmap(db, size)
+	if err != nil {
 		lg.Errorf("[GOOS: %s, GOARCH: %s] mmap failed, size: %d, error: %v", runtime.GOOS, runtime.GOARCH, size, err)
 		return err
 	}
 
-	// Perform unmmap on any error to reset all data fields:
-	// dataref, data, datasz, meta0 and meta1.
+	// Release the new mapping if it cannot be installed.
 	defer func() {
 		if err != nil {
-			if unmapErr := db.munmap(); unmapErr != nil {
+			if unmapErr := newMmap.release(); unmapErr != nil {
 				err = fmt.Errorf("%w; rollback unmap also failed: %v", err, unmapErr)
 			}
 		}
 	}()
 
 	if db.Mlock {
+		// Unlock the current mapping before locking the new one. Existing
+		// readers can continue using the old mapping while it is unlocked.
+		if db.mmapRef != nil {
+			if err := db.munlock(db.mmapRef, fileSize); err != nil {
+				return err
+			}
+		}
+
 		// Don't allow swapping of data file
-		if err := db.mlock(fileSize); err != nil {
+		if err := db.mlock(newMmap, fileSize); err != nil {
 			return err
 		}
 	}
 
-	// Save references to the meta pages.
-	db.meta0 = db.page(0).Meta()
-	db.meta1 = db.page(1).Meta()
+	// Save references to the meta pages from the new mapping.
+	meta0 := newMmap.page(db.pageSize, 0).Meta()
+	meta1 := newMmap.page(db.pageSize, 1).Meta()
 
 	// Validate the meta pages. We only return an error if both meta pages fail
 	// validation, since meta0 failing validation means that it wasn't saved
 	// properly -- but we can recover using meta1. And vice-versa.
-	err0 := db.meta0.Validate()
-	err1 := db.meta1.Validate()
+	err0 := meta0.Validate()
+	err1 := meta1.Validate()
 	if err0 != nil && err1 != nil {
 		lg.Errorf("both meta pages are invalid, meta0: %v, meta1: %v", err0, err1)
 		return err0
+	}
+
+	// Dereference all mmap references before retiring the current mapping.
+	if db.rwtx != nil {
+		db.rwtx.root.dereference()
+	}
+
+	oldMmap := db.mmapRef
+	db.setMmap(newMmap)
+	db.meta0 = meta0
+	db.meta1 = meta1
+
+	if oldMmap != nil {
+		if unmapErr := oldMmap.release(); unmapErr != nil {
+			lg.Errorf("[GOOS: %s, GOARCH: %s] failed to unmap retired mmap, size: %d, error: %v", runtime.GOOS, runtime.GOARCH, oldMmap.size, unmapErr)
+		}
 	}
 
 	return nil
 }
 
 func (db *DB) invalidate() {
-	db.dataref = nil
-	db.data = nil
-	db.datasz = 0
+	db.setMmap(nil)
 
 	db.meta0 = nil
 	db.meta1 = nil
@@ -567,8 +631,13 @@ func (db *DB) munmap() error {
 
 	// gofail: var unmapError string
 	// return errors.New(unmapError)
-	if err := munmap(db); err != nil {
-		db.Logger().Errorf("[GOOS: %s, GOARCH: %s] munmap failed, db.datasz: %d, error: %v", runtime.GOOS, runtime.GOARCH, db.datasz, err)
+	m := db.mmapRef
+	if m == nil {
+		return nil
+	}
+
+	if err := m.release(); err != nil {
+		db.Logger().Errorf("[GOOS: %s, GOARCH: %s] munmap failed, size: %d, error: %v", runtime.GOOS, runtime.GOARCH, m.size, err)
 		return fmt.Errorf("unmap error: %w", err)
 	}
 
@@ -612,31 +681,35 @@ func (db *DB) mmapSize(size int) (int, error) {
 	return int(sz), nil
 }
 
-func (db *DB) munlock(fileSize int) error {
+func (db *DB) munlock(m *dbMmap, fileSize int) error {
 	// gofail: var munlockError string
 	// return errors.New(munlockError)
-	if err := munlock(db, fileSize); err != nil {
-		db.Logger().Errorf("[GOOS: %s, GOARCH: %s] munlock failed, fileSize: %d, db.datasz: %d, error: %v", runtime.GOOS, runtime.GOARCH, fileSize, db.datasz, err)
+	if err := munlock(m, fileSize); err != nil {
+		db.Logger().Errorf("[GOOS: %s, GOARCH: %s] munlock failed, fileSize: %d, mmapSize: %d, error: %v", runtime.GOOS, runtime.GOARCH, fileSize, m.size, err)
 		return fmt.Errorf("munlock error: %w", err)
 	}
 	return nil
 }
 
-func (db *DB) mlock(fileSize int) error {
+func (db *DB) mlock(m *dbMmap, fileSize int) error {
 	// gofail: var mlockError string
 	// return errors.New(mlockError)
-	if err := mlock(db, fileSize); err != nil {
-		db.Logger().Errorf("[GOOS: %s, GOARCH: %s] mlock failed, fileSize: %d, db.datasz: %d, error: %v", runtime.GOOS, runtime.GOARCH, fileSize, db.datasz, err)
+	if err := mlock(m, fileSize); err != nil {
+		db.Logger().Errorf("[GOOS: %s, GOARCH: %s] mlock failed, fileSize: %d, mmapSize: %d, error: %v", runtime.GOOS, runtime.GOARCH, fileSize, m.size, err)
 		return fmt.Errorf("mlock error: %w", err)
 	}
 	return nil
 }
 
 func (db *DB) mrelock(fileSizeFrom, fileSizeTo int) error {
-	if err := db.munlock(fileSizeFrom); err != nil {
+	m := db.mmapRef
+	if m == nil {
+		return nil
+	}
+	if err := db.munlock(m, fileSizeFrom); err != nil {
 		return err
 	}
-	if err := db.mlock(fileSizeTo); err != nil {
+	if err := db.mlock(m, fileSizeTo); err != nil {
 		return err
 	}
 	return nil
@@ -696,10 +769,13 @@ func (db *DB) Close() error {
 	defer db.rwlock.Unlock()
 
 	db.metalock.Lock()
-	defer db.metalock.Unlock()
-
 	db.mmaplock.Lock()
+	db.metalock.Unlock()
 	defer db.mmaplock.Unlock()
+
+	// Read transactions no longer hold mmaplock for their full lifetime, so
+	// wait for them explicitly before unmapping the current mapping.
+	db.readTxWG.Wait()
 
 	return db.close()
 }
@@ -753,14 +829,14 @@ func (db *DB) close() error {
 // will cause the calls to block and be serialized until the current write
 // transaction finishes.
 //
-// Transactions should not be dependent on one another. Opening a read
-// transaction and a write transaction in the same goroutine can cause the
-// writer to deadlock because the database periodically needs to re-mmap itself
-// as it grows and it cannot do that while a read transaction is open.
+// Transactions should not be dependent on one another. A read transaction pins
+// the mmap generation that was current when it began, so writers can continue to
+// remap the database as it grows. Long-running read transactions still prevent
+// old pages and mmap generations from being reclaimed, so close them promptly.
 //
 // If a long running read transaction (for example, a snapshot transaction) is
-// needed, you might want to set DB.InitialMmapSize to a large enough value
-// to avoid potential blocking of write transaction.
+// needed, you might want to set DB.InitialMmapSize to a large enough value to
+// reduce the number of mappings retained by that transaction.
 //
 // IMPORTANT: You must close read-only transactions after you are finished or
 // else the database will not reclaim old pages.
@@ -795,9 +871,9 @@ func (db *DB) beginTx() (*Tx, error) {
 	// write transaction will obtain them.
 	db.metalock.Lock()
 
-	// Obtain a read-only lock on the mmap. When the mmap is remapped it will
-	// obtain a write lock so all transactions must finish before it can be
-	// remapped.
+	// Hold the mmap read lock only while pinning the current mapping. A remap
+	// takes the write lock, so this makes the mapping and meta snapshot atomic
+	// without blocking the writer for the lifetime of the read transaction.
 	db.mmaplock.RLock()
 
 	// Exit if the database is not open yet.
@@ -817,12 +893,16 @@ func (db *DB) beginTx() (*Tx, error) {
 	// Create a transaction associated with the database.
 	t := &Tx{}
 	t.init(db)
+	t.mmap = db.mmapRef
+	t.mmap.retain()
+	db.readTxWG.Add(1)
 
 	if db.freelist != nil {
 		db.freelist.AddReadonlyTXID(t.meta.Txid())
 	}
 
-	// Unlock the meta pages.
+	// The transaction now owns a reference to the mapping.
+	db.mmaplock.RUnlock()
 	db.metalock.Unlock()
 
 	// Update the transaction stats.
@@ -873,9 +953,6 @@ func (db *DB) beginRWTx() (*Tx, error) {
 
 // removeTx removes a transaction from the database.
 func (db *DB) removeTx(tx *Tx) {
-	// Release the read lock on the mmap.
-	db.mmaplock.RUnlock()
-
 	// Use the meta lock to restrict access to the DB object.
 	db.metalock.Lock()
 
@@ -885,6 +962,13 @@ func (db *DB) removeTx(tx *Tx) {
 
 	// Unlock the meta pages.
 	db.metalock.Unlock()
+
+	// Release the mapping only after the transaction can no longer access it.
+	if tx.mmap != nil {
+		_ = tx.mmap.release()
+		tx.mmap = nil
+	}
+	db.readTxWG.Done()
 
 	// Merge statistics.
 	if db.stats != nil {
@@ -1128,8 +1212,7 @@ func (db *DB) Info() *Info {
 
 // page retrieves a page reference from the mmap based on the current page size.
 func (db *DB) page(id common.Pgid) *common.Page {
-	pos := id * common.Pgid(db.pageSize)
-	return (*common.Page)(unsafe.Pointer(&db.data[pos]))
+	return db.mmapRef.page(db.pageSize, id)
 }
 
 // pageInBuffer retrieves a page reference from a given byte array based on the current page size.
@@ -1350,10 +1433,9 @@ type Options struct {
 	// Sets the DB.MmapFlags flag before memory mapping the file.
 	MmapFlags int
 
-	// InitialMmapSize is the initial mmap size of the database
-	// in bytes. Read transactions won't block write transaction
-	// if the InitialMmapSize is large enough to hold database mmap
-	// size. (See DB.Begin for more information)
+	// InitialMmapSize is the initial mmap size of the database in bytes.
+	// A larger value reduces remaps for long-running read transactions, which
+	// pin the mapping that was current when they began.
 	//
 	// If <=0, the initial map size is 0.
 	// If initialMmapSize is smaller than the previous database size,

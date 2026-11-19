@@ -4,11 +4,8 @@ import (
 	"fmt"
 	"syscall"
 	"time"
-	"unsafe"
 
 	"golang.org/x/sys/unix"
-
-	"go.etcd.io/bbolt/internal/common"
 )
 
 // flock acquires an advisory lock on a file descriptor.
@@ -55,38 +52,35 @@ func funlock(db *DB) error {
 }
 
 // mmap memory maps a DB's data file.
-func mmap(db *DB, sz int) error {
+func mmap(db *DB, sz int) (*dbMmap, error) {
 	// Map the data file to memory.
 	b, err := unix.Mmap(int(db.file.Fd()), 0, sz, syscall.PROT_READ, syscall.MAP_SHARED|db.MmapFlags)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// Advise the kernel that the mmap is accessed randomly.
 	err = unix.Madvise(b, syscall.MADV_RANDOM)
 	if err != nil && err != syscall.ENOSYS {
 		// Ignore not implemented error in kernel because it still works.
-		return fmt.Errorf("madvise: %s", err)
+		_ = unix.Munmap(b)
+		return nil, fmt.Errorf("madvise: %s", err)
 	}
 
-	// Save the original byte slice and convert to a byte array pointer.
-	db.dataref = b
-	db.data = (*[common.MaxMapSize]byte)(unsafe.Pointer(&b[0]))
-	db.datasz = sz
-	return nil
+	return newDBMmapFromRef(b, sz), nil
 }
 
 // munmap unmaps a DB's data file from memory.
-func munmap(db *DB) error {
+func munmap(m *dbMmap) error {
 	// Ignore the unmap if we have no mapped data.
-	if db.dataref == nil {
+	if m.dataref == nil {
 		return nil
 	}
 
 	// Unmap using the original byte slice.
-	err := unix.Munmap(db.dataref)
-	db.dataref = nil
-	db.data = nil
-	db.datasz = 0
+	err := unix.Munmap(m.dataref)
+	m.dataref = nil
+	m.data = nil
+	m.size = 0
 	return err
 }

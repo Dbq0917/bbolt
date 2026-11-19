@@ -13,6 +13,10 @@ import (
 	"go.etcd.io/bbolt/internal/common"
 )
 
+func newDBMmapFromPointer(addr uintptr, size int) *dbMmap {
+	return newDBMmap(nil, (*[common.MaxMapSize]byte)(unsafe.Pointer(addr)), size)
+}
+
 // fdatasync flushes written data to a file descriptor.
 func fdatasync(db *DB) error {
 	return db.file.Sync()
@@ -64,13 +68,13 @@ func funlock(db *DB) error {
 
 // mmap memory maps a DB's data file.
 // Based on: https://github.com/edsrzf/mmap-go
-func mmap(db *DB, sz int) error {
+func mmap(db *DB, sz int) (*dbMmap, error) {
 	var sizelo, sizehi uint32
 
 	if !db.readOnly {
 		// Truncate the database to the size of the mmap.
 		if err := db.file.Truncate(int64(sz)); err != nil {
-			return fmt.Errorf("truncate: %s", err)
+			return nil, fmt.Errorf("truncate: %s", err)
 		}
 		sizehi = uint32(sz >> 32)
 		sizelo = uint32(sz)
@@ -79,7 +83,7 @@ func mmap(db *DB, sz int) error {
 	// Open a file mapping handle.
 	h, errno := syscall.CreateFileMapping(syscall.Handle(db.file.Fd()), nil, syscall.PAGE_READONLY, sizehi, sizelo, nil)
 	if h == 0 {
-		return os.NewSyscallError("CreateFileMapping", errno)
+		return nil, os.NewSyscallError("CreateFileMapping", errno)
 	}
 
 	// Create the memory map.
@@ -87,34 +91,31 @@ func mmap(db *DB, sz int) error {
 	if addr == 0 {
 		// Do our best and report error returned from MapViewOfFile.
 		_ = syscall.CloseHandle(h)
-		return os.NewSyscallError("MapViewOfFile", errno)
+		return nil, os.NewSyscallError("MapViewOfFile", errno)
 	}
 
 	// Close mapping handle.
 	if err := syscall.CloseHandle(syscall.Handle(h)); err != nil {
-		return os.NewSyscallError("CloseHandle", err)
+		_ = syscall.UnmapViewOfFile(addr)
+		return nil, os.NewSyscallError("CloseHandle", err)
 	}
 
-	// Convert to a byte array.
-	db.data = (*[common.MaxMapSize]byte)(unsafe.Pointer(addr))
-	db.datasz = sz
-
-	return nil
+	return newDBMmapFromPointer(addr, sz), nil
 }
 
 // munmap unmaps a pointer from a file.
 // Based on: https://github.com/edsrzf/mmap-go
-func munmap(db *DB) error {
-	if db.data == nil {
+func munmap(m *dbMmap) error {
+	if m.data == nil {
 		return nil
 	}
 
-	addr := (uintptr)(unsafe.Pointer(&db.data[0]))
+	addr := (uintptr)(unsafe.Pointer(&m.data[0]))
 	var err1 error
 	if err := syscall.UnmapViewOfFile(addr); err != nil {
 		err1 = os.NewSyscallError("UnmapViewOfFile", err)
 	}
-	db.data = nil
-	db.datasz = 0
+	m.data = nil
+	m.size = 0
 	return err1
 }

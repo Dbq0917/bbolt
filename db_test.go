@@ -545,6 +545,98 @@ func TestDB_Open_InitialMmapSize(t *testing.T) {
 	}
 }
 
+// TestDB_RemapWithLongRunningRead verifies that a writer can remap the database
+// while a read transaction is still using the previous mapping. The reader must
+// keep seeing a consistent snapshot, and the writer must not wait for it.
+func TestDB_RemapWithLongRunningRead(t *testing.T) {
+	db := btesting.MustCreateDBWithOption(t, &bolt.Options{
+		PageSize:        pageSize,
+		InitialMmapSize: pageSize * 8,
+	})
+
+	const (
+		bucketName = "data"
+		stableKey  = "stable"
+	)
+	stableValue := bytes.Repeat([]byte("stable-value"), 64)
+
+	err := db.Update(func(tx *bolt.Tx) error {
+		b, err := tx.CreateBucketIfNotExists([]byte(bucketName))
+		if err != nil {
+			return err
+		}
+		return b.Put([]byte(stableKey), stableValue)
+	})
+	require.NoError(t, err)
+
+	readTx, err := db.Begin(false)
+	require.NoError(t, err)
+
+	stopCh := make(chan struct{})
+	readerDone := make(chan error, 1)
+	go func() {
+		b := readTx.Bucket([]byte(bucketName))
+		for {
+			select {
+			case <-stopCh:
+				readerDone <- nil
+				return
+			default:
+			}
+
+			if value := b.Get([]byte(stableKey)); !bytes.Equal(value, stableValue) {
+				readerDone <- fmt.Errorf("reader observed inconsistent value: %q", value)
+				return
+			}
+			runtime.Gosched()
+		}
+	}()
+
+	writerDone := make(chan error, 1)
+	go func() {
+		for i := 0; i < 6; i++ {
+			err := db.Update(func(tx *bolt.Tx) error {
+				b := tx.Bucket([]byte(bucketName))
+				return b.Put([]byte(fmt.Sprintf("grow-%d", i)), make([]byte, 1<<20))
+			})
+			if err != nil {
+				writerDone <- err
+				return
+			}
+		}
+		writerDone <- nil
+	}()
+
+	select {
+	case err := <-writerDone:
+		require.NoError(t, err)
+	case <-time.After(10 * time.Second):
+		close(stopCh)
+		<-readerDone
+		require.NoError(t, readTx.Rollback())
+		<-writerDone
+		t.Fatal("writer blocked while remapping with a long-running read transaction")
+	}
+
+	close(stopCh)
+	require.NoError(t, <-readerDone)
+	require.NoError(t, readTx.Rollback())
+
+	err = db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(bucketName))
+		if value := b.Get([]byte(stableKey)); !bytes.Equal(value, stableValue) {
+			return fmt.Errorf("unexpected stable value after remap: %q", value)
+		}
+		for i := 0; i < 6; i++ {
+			if value := b.Get([]byte(fmt.Sprintf("grow-%d", i))); len(value) != 1<<20 {
+				return fmt.Errorf("unexpected grow-%d value size after remap: %d", i, len(value))
+			}
+		}
+		return nil
+	})
+	require.NoError(t, err)
+}
+
 // TestDB_Open_ReadOnly checks a database in read only mode can read but not write.
 func TestDB_Open_ReadOnly(t *testing.T) {
 	// Create a writable db, write k-v and close it.

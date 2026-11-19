@@ -28,6 +28,7 @@ type Tx struct {
 	writable       bool
 	managed        bool
 	db             *DB
+	mmap           *dbMmap
 	meta           *common.Meta
 	root           *Bucket
 	pages          map[common.Pgid]*common.Page
@@ -635,8 +636,13 @@ func (tx *Tx) page(id common.Pgid) *common.Page {
 		}
 	}
 
-	// Otherwise return directly from the mmap.
-	p := tx.db.page(id)
+	// Otherwise return directly from the mapping pinned by the transaction.
+	var p *common.Page
+	if tx.mmap != nil {
+		p = tx.mmap.page(tx.db.pageSize, id)
+	} else {
+		p = tx.db.page(id)
+	}
 	p.FastCheck(id)
 	return p
 }
@@ -677,7 +683,7 @@ func (tx *Tx) Page(id int) (*common.PageInfo, error) {
 	}
 
 	// Build the page info.
-	p := tx.db.page(common.Pgid(id))
+	p := tx.page(common.Pgid(id))
 	info := &common.PageInfo{
 		ID:            id,
 		Count:         int(p.Count()),

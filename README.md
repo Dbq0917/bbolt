@@ -160,12 +160,11 @@ are not thread safe. To work with data in multiple goroutines you must start
 a transaction for each one or use locking to ensure only one goroutine accesses
 a transaction at a time. Creating transaction from the `DB` is thread safe.
 
-Transactions should not depend on one another and generally shouldn't be opened
-simultaneously in the same goroutine. This can cause a deadlock as the read-write
-transaction needs to periodically re-map the data file but it cannot do so while
-any read-only transaction is open. Even a nested read-only transaction can cause
-a deadlock, as the child transaction can block the parent transaction from releasing
-its resources.
+Transactions should not depend on one another and should be closed promptly.
+A read-only transaction pins the mmap generation that was current when it began,
+so a read-write transaction can still remap the data file as it grows. However,
+a long-running read-only transaction prevents old pages and mappings from being
+reclaimed, which can increase database size and address-space usage.
 
 #### Read-write transactions
 
