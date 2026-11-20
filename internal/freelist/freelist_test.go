@@ -234,6 +234,53 @@ func TestFreelist_releaseRange(t *testing.T) {
 	}
 }
 
+// Ensure that a page allocated by growing the db file (recorded via
+// RecordAlloc) can be released by ReleasePendingPages even when a
+// long-running read-only transaction is still open, as long as the page
+// was both allocated and freed after the read-only transaction started.
+func TestFreelist_recordAlloc(t *testing.T) {
+	f := newTestFreelist()
+
+	// Simulate a fresh page allocated from the end of the db file by tx 160.
+	f.RecordAlloc(160, 12)
+
+	// The page is freed by tx 200 while a read-only transaction at 150 is open.
+	f.AddReadonlyTXID(150)
+	f.Free(200, common.NewPage(12, 0, 0, 0))
+	f.ReleasePendingPages()
+
+	// The page was both allocated and freed after tx 150 started, so it must
+	// be released even though the read-only transaction is still open.
+	require.Equal(t, common.Pgids([]common.Pgid{12}), f.freePageIds())
+	require.Empty(t, f.pendingPageIds())
+}
+
+// Ensure that a page allocated before the earliest open read-only
+// transaction cannot be released while the transaction is still open,
+// even if its allocation is recorded via RecordAlloc.
+func TestFreelist_recordAlloc_beforeReadonlyTx(t *testing.T) {
+	f := newTestFreelist()
+
+	// Simulate a fresh page allocated from the end of the db file by tx 100.
+	f.RecordAlloc(100, 12)
+
+	// The page is freed by tx 200 while a read-only transaction at 150 is
+	// open. The page might still be visible to the read-only transaction,
+	// so it must stay pending.
+	f.AddReadonlyTXID(150)
+	f.Free(200, common.NewPage(12, 0, 0, 0))
+	f.ReleasePendingPages()
+
+	require.Empty(t, f.freePageIds())
+	require.Equal(t, []common.Pgid{12}, f.pendingPageIds()[200].ids)
+
+	// Once the read-only transaction is closed, the page can be released.
+	f.RemoveReadonlyTXID(150)
+	f.ReleasePendingPages()
+	require.Equal(t, common.Pgids([]common.Pgid{12}), f.freePageIds())
+	require.Empty(t, f.pendingPageIds())
+}
+
 func TestFreeList_init(t *testing.T) {
 	buf := make([]byte, 4096)
 	f := newTestFreelist()

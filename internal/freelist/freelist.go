@@ -49,6 +49,13 @@ type Interface interface {
 	// If the page is already free or is one of the meta pages, then a panic will occur.
 	Free(txId common.Txid, p *common.Page)
 
+	// RecordAlloc records that the given transaction allocated the given page
+	// directly from the end of the db file (i.e. the page isn't reused from
+	// the freelist). The record is used to decide when the page can be
+	// safely released after it's freed, even if some long-running read-only
+	// transactions are still open.
+	RecordAlloc(txId common.Txid, pgid common.Pgid)
+
 	// Freed returns whether a given page is in the free list.
 	Freed(pgId common.Pgid) bool
 

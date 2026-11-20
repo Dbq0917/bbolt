@@ -1216,6 +1216,14 @@ func (db *DB) allocate(txid common.Txid, count int) (*common.Page, error) {
 	curPgid := db.rwtx.meta.Pgid()
 	db.rwtx.meta.SetPgid(curPgid + common.Pgid(count))
 
+	// Record the txid which allocates the fresh pages, so that the
+	// freelist can correctly determine when the pages can be safely
+	// released after they are freed. Otherwise the pages freed by a
+	// transaction can only be released after all read-only transactions
+	// open at that moment are closed, and the db file keeps growing
+	// as long as any long-running read-only transaction is present.
+	db.freelist.RecordAlloc(txid, p.Id())
+
 	return p, nil
 }
 

@@ -117,6 +117,10 @@ func (t *shared) Rollback(txid common.Txid) {
 	}
 }
 
+func (t *shared) RecordAlloc(txid common.Txid, pgid common.Pgid) {
+	t.allocs[pgid] = txid
+}
+
 func (t *shared) AddReadonlyTXID(tid common.Txid) {
 	t.readonlyTXIDs = append(t.readonlyTXIDs, tid)
 }

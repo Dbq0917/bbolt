@@ -796,6 +796,117 @@ func TestTx_releaseRange(t *testing.T) {
 	rollback(rtx7)
 }
 
+// TestTx_RecyclePages_LongRunningReadTx ensures that pages freed by write
+// transactions can be recycled even when a long-running read-only
+// transaction is still open, so that the db file stops growing instead of
+// only being able to reclaim pages after all read-only transactions are
+// closed. The long-running read-only transaction must keep reading a
+// consistent snapshot the whole time.
+func TestTx_RecyclePages_LongRunningReadTx(t *testing.T) {
+	// Set initial mmap size well beyond the limit we will hit in this
+	// test, since we are testing with long running read transactions
+	// and will deadlock if db.grow is triggered.
+	db := btesting.MustCreateDBWithOption(t, &bolt.Options{InitialMmapSize: os.Getpagesize() * 20000})
+
+	bucket := "bucket"
+	keyCount := 2000
+	value := make([]byte, 1024)
+
+	put := func(off int) {
+		if err := db.Update(func(tx *bolt.Tx) error {
+			b, err := tx.CreateBucketIfNotExists([]byte(bucket))
+			if err != nil {
+				return err
+			}
+			for i := 0; i < keyCount; i++ {
+				k := []byte(fmt.Sprintf("key-%06d", off+i))
+				if err := b.Put(k, value); err != nil {
+					return err
+				}
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	delAll := func() {
+		if err := db.Update(func(tx *bolt.Tx) error {
+			b := tx.Bucket([]byte(bucket))
+			return b.ForEach(func(k, v []byte) error {
+				return b.Delete(k)
+			})
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Load the initial data set and open a long-running read-only
+	// transaction, which pins the pages of the initial data set.
+	put(0)
+	rtx, err := db.Begin(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if rtx != nil {
+			if err := rtx.Rollback(); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}()
+
+	// Repeatedly delete and re-insert the whole data set. The first round
+	// has to allocate fresh pages because the freed ones are still pinned
+	// by the read-only transaction. Starting from the second round, the
+	// pages freed by the previous round were allocated after the read-only
+	// transaction started, so they must be recycled and the db file must
+	// stop growing.
+	delAll()
+	put(keyCount)
+	size := fileSize(db.Path())
+	for round := 2; round <= 5; round++ {
+		delAll()
+		put(round * keyCount)
+		if newSize := fileSize(db.Path()); newSize > size {
+			t.Fatalf("db file keeps growing with a long-running read-only transaction open: round %d, size %d -> %d", round, size, newSize)
+		}
+	}
+
+	// The long-running read-only transaction must still read the initial
+	// data set.
+	b := rtx.Bucket([]byte(bucket))
+	if got := b.Get([]byte("key-000000")); !bytes.Equal(got, value) {
+		t.Fatalf("long-running read-only transaction read corrupted data: got %d bytes", len(got))
+	}
+
+	// Once the read-only transaction is closed, all pending pages can be
+	// released, and a fresh read transaction sees the final state.
+	if err := rtx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	rtx = nil
+	put(6 * keyCount)
+	if stats := db.Stats(); stats.FreePageN == 0 {
+		t.Fatal("expected free pages to be released after the long-running read-only transaction is closed")
+	}
+	if newSize := fileSize(db.Path()); newSize > size {
+		t.Fatalf("db file keeps growing after the long-running read-only transaction is closed: size %d -> %d", size, newSize)
+	}
+	if err := db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(bucket))
+		if got := b.Get([]byte(fmt.Sprintf("key-%06d", 5*keyCount))); !bytes.Equal(got, value) {
+			return fmt.Errorf("expected to read the latest data set, got %d bytes", len(got))
+		}
+		if got := b.Get([]byte("key-000000")); got != nil {
+			return fmt.Errorf("expected the initial data set to be deleted, got %d bytes", len(got))
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func ExampleTx_Rollback() {
 	// Open the database.
 	db, err := bolt.Open(tempfile(), 0600, nil)
